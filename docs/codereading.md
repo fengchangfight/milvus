@@ -12,9 +12,170 @@ Milvus 是一个高性能向量数据库，为 AI 应用提供海量非结构化
 
 ---
 
-## 2. 核心设计框架
+## 2. 物理架构: 谁运行在哪里?
 
-### 2.1 分层架构
+### 2.1 两种部署模式
+
+**Standalone (单机模式)**: 所有组件跑在 **1 个进程** 里。
+**Cluster (分布式模式)**: 每个组件是 **独立进程 (K8s Pod)**,通过 gRPC 通信。
+
+### 2.2 进程/节点一览
+
+| 节点 | 进程数 | 类型 | 一句话职责 |
+|------|--------|------|-----------|
+| **Proxy** | 多实例 | 无状态 | gRPC 网关,接收用户所有请求,转发给后端 |
+| **RootCoord** | 1 个(单例) | 有状态 | DDL 老大: 建表/删表/改 Schema/RBAC |
+| **DataCoord** | 1 个(单例) | 有状态 | 数据管家: 管 Segment 生命周期,触发 Flush/Compaction/建索引 |
+| **QueryCoord** | 1 个(单例) | 有状态 | 查询调度: 决定哪些 Segment 加载到哪些 QueryNode |
+| **QueryNode** | 多实例 | 有状态(内存) | 查询工人: 把数据加载到内存,执行向量检索 |
+| **DataNode** | 多实例 | 无状态 | 写入工人: 消费 WAL 消息,把数据持久化到 S3 |
+| **StreamingCoord** | 0(嵌入) | 嵌入 RootCoord | WAL 协调: 管理消息通道分配 |
+| **StreamingNode** | 多实例 | 有状态 | WAL 写入: 接收写入请求,append 到消息队列 |
+| **MixCoord** | 1 个(单例) | 有状态 | Standalone 模式下 RootCoord+DataCoord+QueryCoord 三合一 |
+
+> **关键理解**: Coordinators(协调器) 是大脑,负责决策; Nodes(节点) 是手脚,负责干活。大脑用 etcd 做持久化记忆,手脚挂了可以换新的。
+
+### 2.3 组件通信方式
+
+```
+外部依赖 (独立进程):
+  etcd (服务发现+元数据) ←→ 所有组件
+  MinIO/S3 (对象存储)    ←→ DataNode(写) + QueryNode(读)
+  Kafka/Pulsar (消息队列) ←→ StreamingNode(写) + DataNode(读)
+
+内部 RPC (gRPC):
+  Client → Proxy ................... 用户请求入口
+  Proxy → RootCoord ............... DDL 操作 (建表/删表)
+  Proxy → QueryCoord .............. 查询路由
+  Proxy → StreamingNode ........... 数据写入 (WAL)
+  RootCoord → DataCoord ........... 下发 DDL 给数据层
+  DataCoord → DataNode ............ 下发 Flush/Compaction 任务
+  QueryCoord → QueryNode .......... 下发 Load/Release 任务
+  Proxy → QueryNode ............... 直接查询 (搜索/检索)
+```
+
+---
+
+## 3. 逻辑架构: 数据如何流转?
+
+### 3.1 分层抽象 (从上到下是请求流,从下到上是依赖流)
+
+```
+第 1 层  接入层 (Access)
+         Proxy: 你只跟这一层打交道,它替你找后端
+
+第 2 层  协调层 (Coordination)
+         RootCoord(元数据) + DataCoord(数据生命周期) + QueryCoord(查询调度)
+         它们不存数据,只做决策和记账
+
+第 3 层  流系统 (Streaming / WAL)
+         StreamingCoord + StreamingNode + Kafka/Pulsar
+         写入的数据先到这里,像快递中转站,保证不丢
+
+第 4 层  执行层 (Execution)
+         DataNode(负责存) + QueryNode(负责查)
+         真正的体力劳动者
+
+第 5 层  存储层 (Storage)
+         MinIO/S3: 持久化文件 (Binlog)
+
+第 6 层  引擎层 (Engine)
+         C++ segcore: 向量索引 + 相似度计算,被 QueryNode 用 CGo 调用
+```
+
+### 3.2 写路径 — 数据怎么存进去?
+
+```
+你 insert 100 条向量
+  → Proxy 收到,分配时间戳,发到 WAL (Kafka)
+  → StreamingNode 把数据 append 到消息队列 (每 1 个 VChannel 对应 1 个队列分区)
+  → DataNode 订阅队列,收到数据,攒够一批或到时间就 flush
+  → DataNode 把数据转成 Binlog 文件,上传到 MinIO/S3
+  → DataNode 通知 DataCoord: "Segment 写完了!"
+  → DataCoord 通知 QueryCoord: "有新的 Sealed Segment 可用"
+  → QueryCoord 让某个 QueryNode 把 Segment 从 S3 加载到内存
+  → 现在数据可以被查询了
+```
+
+**为什么这么设计?** 写和查完全解耦。写入只走 WAL,不阻塞查询; 查询只读内存和 S3,不受写入影响。
+
+### 3.3 读路径 — 数据怎么查出来?
+
+```
+你搜索 "找最相似的 10 个向量"
+  → Proxy 收到,查 MetaCache 知道这个 Collection 有哪些 VChannel
+  → Proxy 问 QueryCoord: "每个 VChannel 的数据在哪些 QueryNode 上?"
+  → Proxy 向对应的 QueryNode 并发发送 Search 请求
+  → QueryNode 在自己的 Growing Segment(内存) + Sealed Segment(S3加载的) 中搜索
+  → 搜索时调用 C++ segcore 做向量相似度计算 (最快)
+  → 每个 QueryNode 返回 topK 结果
+  → Proxy 汇总所有结果,全局排序,返回 topK 给客户端
+```
+
+### 3.4 一张总图: 物理部署 vs 逻辑数据流
+
+```
+┌─────────┐     ┌──────────┐     ┌──────────┐
+│  你写的  │────→│  Proxy   │────→│Streaming │────→ Kafka
+│ Python  │     │ (gRPC)   │     │  Node    │    (WAL)
+│  代码   │     └──────────┘     └──────────┘      │
+└─────────┘          │               ↑             │
+                     │               │             ↓
+                     ↓               │        ┌──────────┐
+                ┌──────────┐    ┌────────┐   │ DataNode │
+                │RootCoord │    │Stream  │←──│ (消费WAL) │
+                │(etcd元数)│    │Coord   │   └──────────┘
+                └──────────┘    └────────┘        │
+                     │               ↑            ↓
+                     ↓               │        MinIO/S3
+                ┌──────────┐         │       (Binlog)
+                │DataCoord │         │           │
+                │(Segment) │         │           ↓
+                └──────────┘    ┌──────────┐
+                     │          │QueryCoord│   ┌──────────┐
+                     ↓          │(Load决策) │──→│QueryNode │
+                ┌──────────┐    └──────────┘   │(C++搜)   │
+                │QueryCoord│                   └──────────┘
+                └──────────┘                        ↑
+                     │                              │
+                     ↓                              │
+                QueryNode ────── 读取 S3 Binlog ────┘
+                (内存中检索)
+```
+
+---
+
+## 4. 设计这个系统要解决哪些问题?
+
+### 问题 1: 向量搜索不是传统数据库能干的
+传统数据库 (MySQL/PostgreSQL) 按精确值查找。向量搜索是"找最相似的 100 个",需要算余弦距离/欧氏距离,这是计算密集型任务。**解决**: 用 C++ 写专用搜索引擎 (Faiss/HNSW/DiskANN),CPU/GPU 加速。
+
+### 问题 2: 数据量太大,一台机器放不下
+AI 应用动辄几十亿向量,单机内存/磁盘都不够。**解决**: 按 VChannel (逻辑分片) 把数据打散到多个 QueryNode,每个只负责一部分,查询时并发搜索再汇总。
+
+### 问题 3: 实时写入 + 高性能查询的矛盾
+如果边写边建索引,写入会很慢。如果只建好索引再查,实时性差。**解决**: LSM-tree 思想 — Growing Segment (内存中,不建索引,暴力搜索) + Sealed Segment (持久化后建索引,快速搜索),后台自动 Compaction。
+
+### 问题 4: 写入不能丢
+用户 insert 的数据必须持久化,节点挂了不能丢。**解决**: WAL (Write-Ahead Log) 机制。数据先写 Kafka/Pulsar (高可靠),再异步刷到 S3。如果 DataNode 挂了,换个新的从 WAL 重新消费就行。
+
+### 问题 5: Coordinator 挂了怎么办?
+RootCoord/DataCoord/QueryCoord 都是单例,挂了系统就不可用。**解决**: 状态存在 etcd 里 (高可用),Coordinator 挂了重新选举一个,从 etcd 恢复状态继续工作。
+
+### 问题 6: 查询延迟要低
+向量搜索是 CPU 密集型,每个查询可能扫几百万向量。**解决**: 
+- 索引 (IVF: 聚类缩小搜索范围 / HNSW: 图索引快如闪电)
+- 多段并发 (一个 Collection 的多个 Segment 分布在多个 QueryNode 上并行搜)
+- 内存优先 (Sealed Segment 加载到内存再搜,避免磁盘IO)
+
+### 问题 7: 多种查询类型要共存
+有时用户想"按向量相似度搜 + 按价格>100 过滤 + 按品类分组"。**解决**: Hybrid Search — C++ segcore 支持向量搜索 + 标量表达式过滤同时执行,Proxy 层做 GROUP BY 聚合。
+
+---
+
+## 5. 核心设计框架 (详细)
+
+### 5.1 分层架构
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -42,37 +203,20 @@ Milvus 是一个高性能向量数据库，为 AI 应用提供海量非结构化
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 核心数据流
+### 5.2 核心数据流 (速查)
 
-**写路径 (Write Path)**:
-```
-Client → Proxy → StreamingClient.Append → StreamingNode → WAL Backend
-                                                     ↓
-                                              DataNode (消费)
-                                                     ↓
-                                              MinIO/S3 (Binlog 持久化)
-                                                     ↓
-                                              QueryNode (加载到 segcore)
-```
+| 操作 | 数据流 |
+|------|--------|
+| **写** | Client → Proxy → StreamingNode → WAL → DataNode → MinIO → QueryNode |
+| **读** | Client → Proxy → QueryCoord → QueryNode (segcore) → Proxy → Client |
+| **DDL** | Client → Proxy → RootCoord → etcd + WAL Broadcast → StreamingNodes |
 
-**读路径 (Read Path)**:
-```
-Client → Proxy → QueryCoord (路由) → QueryNode (检索 + 计算) → Proxy → Client
-```
+### 5.3 两种部署模式
 
-**DDL 路径 (CreateCollection等)**:
-```
-Client → Proxy → RootCoord → StreamingClient.Broadcast → StreamingNodes → WAL
-         ↓                ↓
-    MetaCache      etcd (元数据持久化)
-```
+- **Standalone**: 所有组件 1 个进程 (见上文 §2)
+- **Cluster**: 每个组件独立 K8s Pod, gRPC 通信 (见上文 §2)
 
-### 2.3 两种部署模式
-
-- **Standalone Mode**: 所有组件在一个进程中运行 (`cmd/roles/roles.go:MilvusRoles`)
-- **Cluster Mode**: 每个组件独立部署，通过 etcd 服务发现，K8s 原生
-
-### 2.4 核心数据类型
+### 5.4 核心数据类型
 
 - **Collection**: 类似数据库 Table，包含 Schema（字段定义）
 - **Segment**: 数据存储的基本单元，分为 Growing（可写）和 Sealed（只读）
@@ -83,7 +227,7 @@ Client → Proxy → RootCoord → StreamingClient.Broadcast → StreamingNodes 
 
 ---
 
-## 3. Key Features
+## 6. Key Features
 
 | 功能 | 说明 | 关键代码位置 |
 |------|------|-------------|
@@ -105,9 +249,9 @@ Client → Proxy → RootCoord → StreamingClient.Broadcast → StreamingNodes 
 
 ---
 
-## 4. Core Components 详解
+## 7. Core Components 详解
 
-### 4.1 Proxy (接入层) — `internal/proxy/`
+### 7.1 Proxy (接入层) — `internal/proxy/`
 
 最重要的入口，所有客户端请求的第一站。
 
@@ -127,7 +271,7 @@ Client → Proxy → RootCoord → StreamingClient.Broadcast → StreamingNodes 
 - DDL 任务串行执行 (TaskScheduler)，DML 任务可并发
 - 通过 StreamingClient 写入 WAL (新架构) 或 MsgStream (旧架构)
 
-### 4.2 RootCoord (根协调器) — `internal/rootcoord/`
+### 7.2 RootCoord (根协调器) — `internal/rootcoord/`
 
 DDL 入口，管理集群元数据 (Collection, Partition, Field, Alias, RBAC)。
 
@@ -144,7 +288,7 @@ DDL 入口，管理集群元数据 (Collection, Partition, Field, Alias, RBAC)�
 - 通过 TSO 分配全局唯一 ID 和时间戳
 - 三阶段执行: PrePare → Execute → Complete
 
-### 4.3 DataCoord (数据协调器) — `internal/datacoord/`
+### 7.3 DataCoord (数据协调器) — `internal/datacoord/`
 
 管理 Segment 生命周期：分配、Flush、Compaction、索引构建。
 
@@ -166,7 +310,7 @@ DDL 入口，管理集群元数据 (Collection, Partition, Field, Alias, RBAC)�
 - Compaction: L0 (小段合并) → Mix (混合) → Clustering (聚类) → ForceMerge
 - 基于 etcd Watch 实现节点发现
 
-### 4.4 QueryCoord(v2) — `internal/querycoordv2/`
+### 7.4 QueryCoord(v2) — `internal/querycoordv2/`
 
 管理 QueryNode 的负载均衡和 Segment 分配。
 
@@ -182,7 +326,7 @@ DDL 入口，管理集群元数据 (Collection, Partition, Field, Alias, RBAC)�
 - `session/` — QueryNode 会话管理
 - `task/` — 任务执行
 
-### 4.5 QueryNode(v2) — `internal/querynodev2/`
+### 7.5 QueryNode(v2) — `internal/querynodev2/`
 
 **最值得深读的模块！** 向量搜索的执行引擎，Go 层通过 CGo 调用 C++ segcore。
 
@@ -224,7 +368,7 @@ QueryNode
 2. Sealed Segment: DataCoord 通知 → Segment Loader → MinIO 下载 → C++ segcore 加载
 3. Search: Client → Proxy → Delegator.Search() → C++ segcore → 多段结果归并 → Proxy → Client
 
-### 4.6 DataNode — `internal/datanode/`
+### 7.6 DataNode — `internal/datanode/`
 
 数据持久化节点，消费 WAL 消息，写入对象存储。
 
@@ -236,7 +380,7 @@ QueryNode
 - `importv2/` — Bulk Import v2
 - `external/` — 外部数据源处理
 
-### 4.7 Streaming System (流系统) — `internal/streamingcoord/` + `internal/streamingnode/`
+### 7.7 Streaming System (流系统) — `internal/streamingcoord/` + `internal/streamingnode/`
 
 v2.3+ 引入的新 WAL 系统，替代旧的 msgstream。
 
@@ -259,7 +403,7 @@ Proxy → StreamingClient → StreamingNode (Append to PChannel) → WAL Backend
 
 详细文档: `docs/agent_guides/streaming-system/streaming-system.md`
 
-### 4.8 C++ Segcore — `internal/core/src/`
+### 7.8 C++ Segcore — `internal/core/src/`
 
 高性能向量检索引擎的核心 C++ 代码。
 
@@ -276,7 +420,7 @@ Proxy → StreamingClient → StreamingNode (Append to PChannel) → WAL Backend
 - `monitor/` — 内存/性能监控
 - `mmap/` — 内存映射文件
 
-### 4.9 存储层 — `internal/storage/` + `internal/storagev2/`
+### 7.9 存储层 — `internal/storage/` + `internal/storagev2/`
 
 - `internal/storage/` — Binlog 格式 (读写, 编解码)
   - `binlog_writer.go` / `binlog_reader.go` — Binlog 文件读写
@@ -287,7 +431,7 @@ Proxy → StreamingClient → StreamingNode (Append to PChannel) → WAL Backend
   - `pk_statistics.go` — PK 统计信息 (Bloom Filter)
 - `internal/storagev2/packed/` — v2 打包格式 (更高效)
 
-### 4.10 公共包 — `pkg/`
+### 7.10 公共包 — `pkg/`
 
 - `pkg/proto/` — Protobuf 定义
 - `pkg/mq/` — 消息队列抽象 (Kafka/Pulsar/RocksMQ)
@@ -299,7 +443,7 @@ Proxy → StreamingClient → StreamingNode (Append to PChannel) → WAL Backend
 
 ---
 
-## 5. 最值得读的 Top 10 代码
+## 8. 最值得读的 Top 10 代码
 
 | 排名 | 文件 | 行数 | 为什么重要 |
 |------|------|------|-----------|
@@ -324,7 +468,7 @@ Proxy → StreamingClient → StreamingNode (Append to PChannel) → WAL Backend
 
 ---
 
-## 6. 推荐阅读顺序
+## 9. 推荐阅读顺序
 
 ```
 第1天: cmd/roles/roles.go → cmd/components/*.go
