@@ -199,3 +199,191 @@ index_params = {
 - Kafka 存数据贵 (内存 + 磁盘)，S3 便宜
 - WAL 保留时间短 (比如 3 天)，S3 永久保留
 - WAL 是流式顺序读写，S3 适合大文件随机读 (Sealed Segment 有索引后 QueryNode 直接加载)
+
+---
+
+## Q6: Insert 请求的完整写入路径
+
+一条数据从 Proxy 到 S3 一共经过 7 个阶段:
+
+### 阶段 1: Proxy 接收 + TSO 分配
+
+```go
+// internal/proxy/impl.go:2744
+func (node *Proxy) Insert(ctx context.Context, request *milvuspb.InsertRequest) (*milvuspb.MutationResult, error)
+```
+
+Proxy 把 `InsertRequest` 包成 `insertTask`，推入 `dmQueue` (DML 队列)。
+
+**入队时立即分配 TSO** (`internal/proxy/task_scheduler.go:221`):
+```go
+ts, err = queue.tsoAllocatorIns.AllocOne(t.TraceCtx())  // 向 RootCoord 请求全局时间戳
+t.SetTs(ts)  // 写入 BeginTimestamp 和 EndTimestamp
+```
+TSO 是一个全局单调递增的 int64，RootCoord 是 TSO 的唯一源。每个 insert 请求得到一个 TSO，用来保证全局写入顺序。
+
+### 阶段 2: PreExecute — 分配 RowID + 校验
+
+```go
+// internal/proxy/task_insert.go:103
+func (it *insertTask) PreExecute(ctx context.Context) error
+```
+
+- 分配 RowID (全局唯一主键，基于 TSO 生成)
+- 给每行数据设置时间戳 (`BeginTimestamp`)
+- 校验字段类型、长度限制、Partition Key 等
+
+### 阶段 3: Execute — 按 VChannel 拆分 + 写入 WAL
+
+```go
+// internal/proxy/task_insert_streaming.go:29
+func (it *insertTask) Execute(ctx context.Context) error
+```
+
+1. **按 PK Hash 分配到 VChannel**: 每行数据根据主键 hash 决定去哪个 Shard (VChannel)
+2. **构建 Insert 消息** (`message.NewInsertMessageBuilderV1()`):
+   - **Header**: CollectionID + Partition → Segment 分配信息 (`PartitionSegmentAssignment`)
+   - **Body**: 列式字段数据 (`FieldsData[]`), RowIDs, Timestamps
+3. **写入 WAL**:
+   ```go
+   resp := streaming.WAL().AppendMessages(ctx, msgs...)
+   ```
+
+### 阶段 4: StreamingNode — Segment 分配 + 持久化到 WAL 后端
+
+Proxy 的 Append 请求到达 StreamingNode，经过 interceptor 链:
+
+1. **Shard Interceptor** (`shard_interceptor.go:148`) — 最关键的步骤:
+   - 检查 Collection Schema 版本是否匹配
+   - **分配 Segment**: `shardManager.AssignSegment(req)` → 如果当前 Segment 满了或超时了就建新 Segment
+   - 将 Segment 分配结果附到消息上
+2. **Lock Interceptor** — 按 key 加锁保证同 VChannel 内顺序
+3. **TimeTick Interceptor** — 维护消息的逻辑时间戳
+4. **WAB (Write Ahead Buffer)** — 缓冲后批量刷盘
+5. **WAL 后端写入** (`pkg/streaming/walimpls/wal.go:38`): 调用具体的 WAL 实现 (Kafka/Pulsar/RocksMQ) 持久化
+
+### 阶段 5: DataNode 消费 — 从 WAL 读到内存 WriteBuffer
+
+DataNode 订阅 WAL (`internal/flushcommon/pipeline/flow_graph_dmstream_input_node.go:44`)：
+
+```
+dmStreamNode (订阅 WAL)
+  → ddNode (过滤: 按 MsgType 分类 Insert/Delete/CreateSegment)
+  → writeNode (处理 Insert)
+```
+
+**writeNode** (`flow_graph_write_node.go:101`):
+1. `PrepareInsert()` — 将 `msgstream.InsertMsg` 转为 `storage.InsertData` (按 Segment 分组的列式数据)
+2. `WriteBuffer.BufferData()` — 数据进入内存 WriteBuffer,等待触发 flush
+
+### 阶段 6: Flush — 内存 WriteBuffer → Binlog 文件
+
+当满足 flush 条件时 (大小/时间/Fence 信号):
+
+**SyncTask.Run()** (`internal/flushcommon/syncmgr/task.go:116`):
+1. 根据存储版本选 Writer: `BulkPackWriter` (V1) / `BulkPackWriterV2` (V2) / `BulkPackWriterV3` (V3)
+2. `BulkPackWriter.Write()` (`pack_writer.go:70`) 写入 4 类文件:
+   - **InsertLog**: 字段数据,每个字段独立一个 binlog 文件
+   - **StatsLog**: PK Bloom Filter
+   - **DeltaLog**: 删除记录
+   - **BM25Stats**: 全文检索统计
+
+### 阶段 7: Binlog 格式 — 落盘到 S3/MinIO
+
+```
+一个 Segment 的落盘产物:
+  Segment_12345/
+    ├── insert_log/
+    │   ├── 456_100_0.binlog      ← Field 100 (主键) 的插入数据
+    │   ├── 456_101_0.binlog      ← Field 101 (向量) 的插入数据
+    │   └── 456_102_0.binlog      ← Field 102 (标量) 的插入数据
+    ├── stats_log/
+    │   └── 456_100_0.binlog      ← PK 统计 (Bloom Filter)
+    └── delta_log/
+        └── 456_0_0.binlog        ← 删除记录
+
+binlog 文件内部格式 (binlog_writer.go:122):
+┌──────────────────────┐
+│ MagicNumber (0xfffabc)│  ← 4 bytes
+├──────────────────────┤
+│ Descriptor Event      │  ← 元数据: CollectionID, PartitionID, SegmentID, FieldID, TS range
+├──────────────────────┤
+│ Insert Event 1        │  ← EventHeader(Timestamp, TypeCode, Length) + 列式 Payload
+├──────────────────────┤
+│ Insert Event 2        │
+├──────────────────────┤
+│ ...                   │
+└──────────────────────┘
+```
+
+每个 `Insert Event` 包含 `InsertData` (列式存储):
+- 系统字段: RowID (FieldID=0), Timestamp (FieldID=1)
+- 用户字段: 按 FieldID 索引 (例如 FieldID=100 是 pk, FieldID=101 是 vector)
+- 数据序列化为 Arrow Record Batch 或 Protobuf bytes
+
+### 端到端时序图
+
+```
+Client          Proxy         RootCoord    StreamingNode    WAL(Kafka)    DataNode      S3/MinIO
+  │               │               │              │              │             │             │
+  │ Insert(100条) │               │              │              │             │             │
+  │──────────────→│               │              │              │             │             │
+  │               │ AllocTSO()    │              │              │             │             │
+  │               │──────────────→│              │              │             │             │
+  │               │  ts=1001      │              │              │             │             │
+  │               │←──────────────│              │              │             │             │
+  │               │               │              │              │             │             │
+  │               │ PreExecute:   │              │              │             │             │
+  │               │ 分配RowID     │              │              │             │             │
+  │               │ 校验Schema    │              │              │             │             │
+  │               │               │              │              │             │             │
+  │               │ Execute:      │              │              │             │             │
+  │               │ 按PK hash→    │              │              │             │             │
+  │               │ 2个VChannel   │              │              │             │             │
+  │               │               │ AppendMessages             │             │             │
+  │               │───────────────│─────────────→│              │             │             │
+  │               │               │ Assign Seg   │              │             │             │
+  │               │               │              │ Append(WAL)  │             │             │
+  │               │               │              │─────────────→│             │             │
+  │               │←── 返回成功 ──│←─────────────│              │             │             │
+  │←── 返回成功 ──│               │              │              │             │             │
+  │               │               │              │              │             │             │
+  │               │               │              │  消费消息     │             │             │
+  │               │               │              │              │────────────→│             │
+  │               │               │              │              │             │ BufferData  │
+  │               │               │              │              │             │ 内存缓冲     │
+  │               │               │              │              │             │             │
+  │               │               │              │              │   ...攒够flush条件...     │
+  │               │               │              │              │             │             │
+  │               │               │              │              │             │ SyncTask    │
+  │               │               │              │              │             │ BuildBinlog │
+  │               │               │              │              │             │─────────────→│
+  │               │               │              │              │             │←── 上传完成 │
+```
+
+### 关键的"分叉"点
+
+- **Proxy 按 PK Hash 分 VChannel** (`task_insert_streaming.go:101`): 决定数据去哪个 Shard
+- **StreamingNode 分配 Segment** (`shard_interceptor.go:206`): 决定数据写入哪个 Segment (Growing/新建)
+- **DataNode Flush** (`write_buffer.go:510`): 决定何时把内存数据刷到 S3
+- **Field 级别独立 Binlog**: 每个字段独立一个文件,加载时可以只读需要的字段
+
+### 代码索引
+
+| 步骤 | 文件 | 行列 |
+|------|------|------|
+| Proxy 入口 | `internal/proxy/impl.go` | :2744 |
+| TSO 分配 | `internal/proxy/task_scheduler.go` | :221 |
+| PreExecute | `internal/proxy/task_insert.go` | :103 |
+| Execute (WAL 写入) | `internal/proxy/task_insert_streaming.go` | :29 |
+| WAL AppendMessages | `internal/distributed/streaming/util.go` | :22 |
+| StreamingNode Appender | `internal/streamingnode/server/wal/adaptor/wal_adaptor.go` | :154 |
+| Shard Interceptor | `internal/streamingnode/server/wal/interceptors/shard/shard_interceptor.go` | :148 |
+| WAL 后端接口 | `pkg/streaming/walimpls/wal.go` | :31 |
+| DataNode 订阅 | `internal/flushcommon/pipeline/flow_graph_dmstream_input_node.go` | :44 |
+| DD Node 过滤 | `internal/flushcommon/pipeline/flow_graph_dd_node.go` | :96 |
+| WriteNode | `internal/flushcommon/pipeline/flow_graph_write_node.go` | :101 |
+| WriteBuffer | `internal/flushcommon/writebuffer/write_buffer.go` | :510 |
+| SyncTask Run | `internal/flushcommon/syncmgr/task.go` | :116 |
+| Binlog Writer | `internal/storage/binlog_writer.go` | :122 |
+| Binlog 格式定义 | `internal/storage/event_header.go`, `insert_data.go`, `data_codec.go` | — |

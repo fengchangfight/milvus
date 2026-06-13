@@ -104,19 +104,27 @@ Milvus 是一个高性能向量数据库，为 AI 应用提供海量非结构化
 
 ### 3.2 写路径 — 数据怎么存进去?
 
+> 完整端到端追踪见 `docs/questions.md` §Q6，以下为概要。
+
 ```
 你 insert 100 条向量
-  → Proxy 收到,分配时间戳,发到 WAL (Kafka)
-  → StreamingNode 把数据 append 到消息队列 (每 1 个 VChannel 对应 1 个队列分区)
-  → DataNode 订阅队列,收到数据,攒够一批或到时间就 flush
-  → DataNode 把数据转成 Binlog 文件,上传到 MinIO/S3
-  → DataNode 通知 DataCoord: "Segment 写完了!"
-  → DataCoord 通知 QueryCoord: "有新的 Sealed Segment 可用"
-  → QueryCoord 让某个 QueryNode 把 Segment 从 S3 加载到内存
+  → Proxy 收到,向 RootCoord 申请 TSO(全局时间戳)
+  → PreExecute: 分配 RowID,校验 Schema
+  → Execute: 按 PK hash 分 VChannel,构建 InsertMessage(Header=Segment分配, Body=列式数据)
+  → StreamingNode: Shard Interceptor 分配 Segment,写入 WAL(Kafka)
+  → 返回成功,客户端可继续
+  → DataNode 异步消费 WAL: ddNode 过滤 → writeNode 转 InsertData → WriteBuffer 缓冲
+  → Flush 条件满足: SyncTask 构建 Binlog(每字段独立文件) → 上传 S3/MinIO
+  → DataCoord 收到通知,QueryCoord 让 QueryNode 加载新 Segment 到内存
   → 现在数据可以被查询了
 ```
 
 **为什么这么设计?** 写和查完全解耦。写入只走 WAL,不阻塞查询; 查询只读内存和 S3,不受写入影响。
+
+**核心"分叉"决策点**:
+- Proxy 按 PK hash → VChannel (决定去哪个 Shard)
+- StreamingNode → 分配 Segment (决定写哪个 Growing Segment)
+- DataNode → 触发 Flush (决定何时刷 S3)
 
 ### 3.3 读路径 — 数据怎么查出来?
 
