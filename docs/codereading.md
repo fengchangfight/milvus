@@ -10,6 +10,25 @@ Milvus 是一个高性能向量数据库，为 AI 应用提供海量非结构化
 - **注册中心**: etcd (服务发现 + 元数据存储)
 - **消息队列**: Kafka / Pulsar / RocksMQ(Standalone)
 
+### 1.1 Milvus 的输入是什么?
+
+**向量 (Vector) + 标量字段 (Scalar Fields)**。Milvus 不负责把原始数据转成向量 (Embedding)，只负责存储和检索。
+
+```
+原始数据 (文本/图片/音频)
+    ↓ 你调用 embedding 模型 (OpenAI/BGE/ColBERT...)
+向量 [0.12, -0.34, ...]   ← 这才是 Milvus 的输入
+    +
+标量字段 {id, title, price, ...}
+    ↓
+一起 insert 进 Milvus
+```
+
+- Milvus 是 **向量数据库**，不是文档数据库。它不知道你的原始文本/图片长什么样
+- 新版支持 **Function Field**: insert 时自动调用外部 embedding 服务，但本质上还是"先转向量再存"
+- 搜索时同样: 你先把 query 用同一模型转成向量，再发给 Milvus 做相似度检索
+- 返回的是最相似的向量所对应的标量字段 (如 text, id)，而不是原始 chunk
+
 ---
 
 ## 2. 物理架构: 谁运行在哪里?
