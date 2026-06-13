@@ -175,6 +175,14 @@ AI 应用动辄几十亿向量,单机内存/磁盘都不够。**解决**: 按 VC
 ### 问题 3: 实时写入 + 高性能查询的矛盾
 如果边写边建索引,写入会很慢。如果只建好索引再查,实时性差。**解决**: LSM-tree 思想 — Growing Segment (内存中,不建索引,暴力搜索) + Sealed Segment (持久化后建索引,快速搜索),后台自动 Compaction。
 
+### 问题 3b: 为什么有 VChannel 和 PChannel 两层通道？
+直接让每个 Shard 对应一个 Kafka Partition 不行吗？
+- **物理资源的限制**: Kafka 的 Partition 数量有限且固定(默认 16 个)。如果 100 个 Collection 各 8 个 Shard,就需要 800 个 Partition — 太多,Kafka 撑不住
+- **多租户共享**: 用固定 PChannel 池(16个),VChannel 在其上多路复用。不同 Collection 的 VChannel 共享同一个 PChannel
+- **解耦逻辑与物理**: 建多少 Shard 是 Collection 层面的逻辑决策,有多少 Kafka Partition 是集群层面的物理决策,两者不应耦合
+
+详见 `docs/questions.md` §Q1。
+
 ### 问题 4: 写入不能丢
 用户 insert 的数据必须持久化,节点挂了不能丢。**解决**: WAL (Write-Ahead Log) 机制。数据先写 Kafka/Pulsar (高可靠),再异步刷到 S3。如果 DataNode 挂了,换个新的从 WAL 重新消费就行。
 
@@ -189,6 +197,14 @@ RootCoord/DataCoord/QueryCoord 都是单例,挂了系统就不可用。**解决*
 
 ### 问题 7: 多种查询类型要共存
 有时用户想"按向量相似度搜 + 按价格>100 过滤 + 按品类分组"。**解决**: Hybrid Search — C++ segcore 支持向量搜索 + 标量表达式过滤同时执行,Proxy 层做 GROUP BY 聚合。
+
+### 问题 8: 向量索引怎么这么快？
+向量搜索是 O(N*dim) 的暴力计算,十亿量级不可行。**解决**:
+- **IVF (聚类)**: 先 K-Means 聚成 N 个簇,搜索时只搜最近 nprobe 个簇,精度/速度可调
+- **HNSW (图)**: 构建多层近邻图,搜索时贪心遍历,理论复杂度 O(log N)
+- **DiskANN**: 索引存磁盘按需加载,内存不够也能搜海量数据
+- **PQ/SCANN (量化)**: 将高维向量压缩编码,在压缩空间里快速计算近似距离
+- 所有方法通过 **Knowhere** 统一封装,建表时通过 `index_type` 参数选择
 
 ---
 
@@ -238,11 +254,22 @@ RootCoord/DataCoord/QueryCoord 都是单例,挂了系统就不可用。**解决*
 ### 5.4 核心数据类型
 
 - **Collection**: 类似数据库 Table，包含 Schema（字段定义）
+- **Shard**: Collection 的逻辑分片,建表时指定 `shards_num`。决定写入和查询的并行度,每个 Shard 对应 1 个 VChannel
 - **Segment**: 数据存储的基本单元，分为 Growing（可写）和 Sealed（只读）
-- **VChannel**: 逻辑分片，一个 Collection 按 shard 分成多个 VChannel
-- **PChannel**: 物理通道，映射到 WAL 的一个 Topic/Partition
+- **VChannel (Virtual Channel)**: 逻辑通道,1 Shard = 1 VChannel。命名格式 `<pchannel>_<collectionID>v<shardIndex>`。同一 VChannel 内消息保序
+- **PChannel (Physical Channel)**: 物理通道,固定数量 (默认 16),每 1 个 PChannel 映射到 1 个 Kafka Topic/Partition。N 个 VChannel 复用 1 个 PChannel
 - **TimeTick**: 全局单调递增逻辑时钟，保证写入有序
 - **Hybrid Timestamp (HybridTs)**: TSO(全局排序) + LocalTs(本地排序)
+
+**Shard → VChannel → PChannel 关系图**:
+```
+Collection (shards_num=2)
+  ├── Shard 0  ←→  VChannel "dml_0_12345v0"  ─┐
+  └── Shard 1  ←→  VChannel "dml_3_12345v1"  ─┤
+                                                ├─ 复用 PChannel 池 (固定16个)
+  其他 Collection 的 VChannels ─────────────────┘
+```
+`ToPhysicalChannel("dml_0_12345v0")` → `"dml_0"` （提取所属 PChannel,见 `pkg/util/funcutil/func.go:393`）
 
 ---
 
@@ -424,11 +451,11 @@ Proxy → StreamingClient → StreamingNode (Append to PChannel) → WAL Backend
 
 ### 7.8 C++ Segcore — `internal/core/src/`
 
-高性能向量检索引擎的核心 C++ 代码。
+高性能向量检索引擎的核心 C++ 代码。**底层通过 Knowhere 统一封装多种索引库** (Faiss/HNSW/DiskANN/SCANN/GPU-CAGRA)，Go 端通过 CGo 调用。具体支持哪些索引类型由编译进 C++ 的 segcore 在运行时暴露 — 见 `internal/util/vecindexmgr/vector_index_mgr.go:117-134`。
 
 **目录结构**:
 - `segcore/` — 核心搜索执行引擎
-- `index/` — 向量索引 (IVF/HNSW/DiskANN/SCANN)
+- `index/` — 向量索引 (IVF/HNSW/DiskANN/SCANN)，通过 Knowhere 适配
 - `expr/` — 表达式求值器 (标量过滤)
 - `query/` — 查询处理
 - `storage/` — C++ 端存储接口
@@ -445,8 +472,10 @@ Proxy → StreamingClient → StreamingNode (Append to PChannel) → WAL Backend
   - `binlog_writer.go` / `binlog_reader.go` — Binlog 文件读写
   - `insert_data.go` / `delta_data.go` — 插入/删除数据编解码
   - `data_codec.go` — 数据序列化
+  - `factory.go` — 存储工厂: 根据 `common.storageType` 选择 `local` / `remote`(MinIO) / `opendal`
+  - `local_chunk_manager.go` — 本地磁盘实现 (开发/测试用)
+  - `remote_chunk_manager.go` — S3/MinIO/Azure 云存储
   - `minio_object_storage.go` / `azure_object_storage.go` — 云存储适配
-  - `remote_chunk_manager.go` — 远程存储分块管理
   - `pk_statistics.go` — PK 统计信息 (Bloom Filter)
 - `internal/storagev2/packed/` — v2 打包格式 (更高效)
 
